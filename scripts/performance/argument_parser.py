@@ -454,6 +454,13 @@ def parse_cli_args():
         default=None,
     )
     parser.add_argument(
+        "--hidden_size",
+        type=int,
+        help="Hidden size to use for the experiment. Defaults to None.",
+        required=False,
+        default=None,
+    )
+    parser.add_argument(
         "--additional_slurm_params",
         type=str,
         help="Additional SLURM parameters as key=value pairs. "

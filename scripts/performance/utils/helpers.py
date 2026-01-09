@@ -260,6 +260,9 @@ def set_user_overrides(recipe: ConfigContainer, kwargs: Dict[str, Any]) -> None:
     if kwargs.get("megatron_ckpt") is not None:
         recipe.checkpoint.pretrained_checkpoint = "/mnt/megatron_ckpt"
 
+    if kwargs.get("hidden_size") is not None:
+        recipe.model.hidden_size = kwargs.get("hidden_size")
+
     # Handle checkpoint configuration
     checkpoint_dir = kwargs.get("checkpoint_dir")
     checkpoint_interval = kwargs.get("checkpoint_interval")
