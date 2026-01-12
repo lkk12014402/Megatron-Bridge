@@ -529,6 +529,17 @@ def get_model(
         else:
             model = _create_model(model_provider, model_type)
 
+        model_config = get_model_config(model[0])
+
+        if (model_config.fp16 or model_config.bf16) and mixed_precision_wrapper is not None:
+            model = [mixed_precision_wrapper(model_config, model_module) for model_module in model]
+
+            # Maintain expert bias in float32 wrapped in Float16Module
+            for model_module in model:
+                for submodule in model_module.modules():
+                    if hasattr(submodule, "_maintain_float32_expert_bias"):
+                        submodule._maintain_float32_expert_bias()
+
         if pre_wrap_hook:
             if isinstance(pre_wrap_hook, list):
                 # Execute hooks in order
@@ -553,8 +564,6 @@ def get_model(
 
         _print_num_params(model)
 
-        model_config = get_model_config(model[0])
-
         # GPU allocation.
         # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
         # in the fully_shard function of FSDP2 instead.
@@ -565,9 +574,6 @@ def get_model(
         ):
             for model_module in model:
                 model_module.cuda(torch.cuda.current_device())
-
-        if (model_config.fp16 or model_config.bf16) and mixed_precision_wrapper is not None:
-            model = [mixed_precision_wrapper(model_config, model_module) for model_module in model]
 
         if correct_amax_history_if_needed is not None:
             correct_amax_history_if_needed(model)
