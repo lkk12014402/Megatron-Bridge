@@ -138,6 +138,7 @@ def evaluate(
                 forward_only=True,
             )
             # Synchronize the full_iteration cuda graph to avoid race conditions
+            # TODO: remove this after fix in MCore
             if state.cfg.model.cuda_graph_impl == "local" and "full_iteration" in state.cfg.model.cuda_graph_scope:
                 torch.cuda.synchronize()
             fault_tolerance.on_eval_step_end(state)
