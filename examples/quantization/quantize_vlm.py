@@ -58,7 +58,6 @@ from transformers import AutoProcessor
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.decorators import torchrun_main
-from megatron.bridge.models.gpt_provider import quantization_layer_spec
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 
 
@@ -94,15 +93,25 @@ def get_coco_dataloader(
     Yields:
         List of messages in OpenAI format.
     """
+    # Use custom cache dir to avoid filling up root filesystem
+    cache_dir = os.environ.get("HF_HOME", "/opt/Megatron-Bridge/cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Set environment variables to override ALL HuggingFace cache locations
+    os.environ["HF_HOME"] = cache_dir
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(cache_dir, "datasets")
+    os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(cache_dir, "hub")
+
     dataset = load_dataset(
         dataset_name,
         split="train",
         trust_remote_code=True,
-    )
+        streaming=True,
+        cache_dir=cache_dir,
+    ).take(calib_size)  # Only download calib_size samples
 
-    calib_size = min(len(dataset), calib_size)
-    for i in range(calib_size):
-        image = dataset[i]["image"]
+    for i, sample in enumerate(dataset):
+        image = sample["image"]
         if image.mode != "RGB":
             image = image.convert("RGB")
         prompt = CALIBRATION_PROMPTS[i % len(CALIBRATION_PROMPTS)]
@@ -150,16 +159,20 @@ def _hf_dataset_forward_loop_func(
         input_ids = inputs.input_ids.cuda()
         pixel_values = getattr(inputs, "pixel_values", None)
         image_grid_thw = getattr(inputs, "image_grid_thw", None)
+        image_sizes = getattr(inputs, "image_sizes", None)
         if pixel_values is not None:
             pixel_values = pixel_values.cuda()
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.cuda()
+        if image_sizes is not None:
+            image_sizes = image_sizes.cuda()
 
         megatron_generate(
             model=model,
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            image_sizes=image_sizes,
             osl=1,
             enable_kv_cache=False,
             disable_tqdm=True,
@@ -177,14 +190,14 @@ def _custom_prompt_forward_loop_func(
     is_rank_0: bool,
     prompts: str,
     osl: int = 32,
-    test_image_url: str = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+    test_image_path: str = "/models/demo.jpeg",
 ):
     """Test the quantized VLM model with an image and prompt."""
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": test_image_url},
+                {"type": "image", "image": test_image_path},
                 {"type": "text", "text": prompts},
             ],
         }
@@ -197,10 +210,13 @@ def _custom_prompt_forward_loop_func(
     input_ids = inputs.input_ids.cuda()
     pixel_values = getattr(inputs, "pixel_values", None)
     image_grid_thw = getattr(inputs, "image_grid_thw", None)
+    image_sizes = getattr(inputs, "image_sizes", None)
     if pixel_values is not None:
         pixel_values = pixel_values.cuda()
     if image_grid_thw is not None:
         image_grid_thw = image_grid_thw.cuda()
+    if image_sizes is not None:
+        image_sizes = image_sizes.cuda()
 
     eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
     eos_token_ids = [eos_token_id] if eos_token_id else []
@@ -210,6 +226,7 @@ def _custom_prompt_forward_loop_func(
         input_ids=input_ids,
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
+        image_sizes=image_sizes,
         osl=osl,
         eos_token_id=eos_token_ids,
         enable_kv_cache=False,
@@ -217,7 +234,7 @@ def _custom_prompt_forward_loop_func(
     )
 
     if is_rank_0:
-        console.print(f"[green]Image:[/green] {test_image_url}")
+        console.print(f"[green]Image:[/green] {test_image_path}")
         console.print(f"[green]Prompt:[/green] {prompts}")
         console.print(
             f"[green]Generated:[/green] {processor.tokenizer.decode(generated_ids[0], skip_special_tokens=False)}"
@@ -240,6 +257,7 @@ def main(
     force_all_expert_routing: bool = False,
     trust_remote_code: bool = True,
     prompts: str = "Describe this image.",
+    skip_quantization: bool = False,
 ) -> None:
     """Perform quantization from HuggingFace VLM model to quantized Megatron-LM model on multiple GPUs."""
     if os.environ.get("WORLD_SIZE") is None:
@@ -263,10 +281,7 @@ def main(
     model_provider.expert_model_parallel_size = ep
     model_provider.expert_tensor_parallel_size = etp
     model_provider.pipeline_dtype = torch.bfloat16
-    # Disable MoE permute fusion for SequentialMLP (used by quantization_layer_spec)
-    # The fused kernels are optimized for TEGroupedMLP and cause issues with SequentialMLP
-    model_provider.moe_permute_fusion = False
-    model_provider.language_transformer_layer_spec = quantization_layer_spec
+
     model_provider.finalize()
     model_provider.initialize_model_parallel(seed=0)
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
@@ -284,8 +299,7 @@ def main(
     if is_rank_0:
         table = create_quantization_stats_table()
 
-    # Apply quantization
-    if export_quant_cfg in QUANT_CFG_CHOICES:
+    if export_quant_cfg in QUANT_CFG_CHOICES and not skip_quantization:
         if is_rank_0:
             console.print(f"[green]Quantizing the model with {export_quant_cfg} configuration...[/green]")
 
@@ -335,15 +349,19 @@ def main(
                     table.add_row(k, "", "")
 
             console.print(table)
+    elif skip_quantization:
+        unwrapped_model = unwrap_model(megatron_model)[0]
+        if is_rank_0:
+            console.print(f"[green]Not Quantized Model:\n {unwrapped_model}[/green]")
+            console.print("[yellow]⚠ Skipping quantization (--skip-quantization flag set)[/yellow]")
 
     # Save quantized model
     if megatron_save_path is None:
         model_name = hf_model_id.replace("/", "_")
         megatron_save_path = f"./{model_name}_quantized_{export_quant_cfg}"
 
-    # Test quantized model
     if is_rank_0:
-        console.print("[green]Testing quantized model with custom prompt...[/green]")
+        console.print("[green]Testing model AFTER quantization...[/green]")
 
     _custom_prompt_forward_loop_func(unwrapped_model, processor, is_rank_0, prompts)
 
@@ -381,6 +399,12 @@ if __name__ == "__main__":
         default="Describe this image.",
         help="Text prompt for testing quantized model.",
     )
+    parser.add_argument(
+        "--skip-quantization",
+        action="store_true",
+        default=False,
+        help="Skip quantization (use default layer spec, useful for debugging)",
+    )
     args = parser.parse_args()
     main(
         args.hf_model_id,
@@ -397,6 +421,7 @@ if __name__ == "__main__":
         args.force_all_expert_routing,
         args.trust_remote_code,
         args.prompts,
+        args.skip_quantization,
     )
 
     if torch.distributed.is_initialized():

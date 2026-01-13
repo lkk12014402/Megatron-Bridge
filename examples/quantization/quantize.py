@@ -81,7 +81,6 @@ def _hf_dataset_forward_loop_func(model, tokenizer, calib_size, force_all_expert
 
     for prompt in tqdm(dataloader, total=calib_size, disable=torch.distributed.get_rank()):
         tokens = tokenizer(prompt, return_tensors="pt")
-        # Use megatron_generate for calibration (same as quantize.py)
         megatron_generate(model, tokens.input_ids.cuda(), osl=1)
 
         if force_all_expert_routing:
